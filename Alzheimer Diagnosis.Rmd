@@ -1,0 +1,385 @@
+---
+title: "Alzheimer Diagnoses Predictions"
+author: "caitl-k"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(psych)
+library(tidyverse)
+library(randomForest)
+library(xgboost)
+library(kernlab)
+library(pROC)
+```
+
+## Data Understanding
+
+### Loading
+
+```{r}
+alz.df <- read.csv("./alzheimers.csv")
+```
+
+### Quality Evaluation
+
+```{r}
+str(alz.df)
+```
+
+The dataset has 2,149 observations and 35 variables, which is suitable for implementing a kNN model. Features will analyzed to ensure quality and relevancy prior to preparing the model:
+
+  * Data Types
+  
+  The "PatientID" variable is classified as an integer data type despite containing categorical values. It is also a unique identifier rather than a predicting feature for Alzheimers. 
+
+  * Irrelevant Variables
+
+  The "DoctorInCharge" variable contains information about the overseeing doctor, which won't be relevant information for predicting Alzheimers. 
+  
+  * Missing Values
+
+```{r}
+summary(alz.df)
+```
+There are no missing values to handle. 
+
+Overall, the dataset appears to be well-structured with minimal issues. 
+
+We can differentiate between feature data types:
+
+Continuous Features:
+
+* ADL
+* FunctionalAssesment
+* MMSE
+* CholesterolTriglycerides
+* CholesterolHDL
+* CholesterolLDL
+* CholesterolTotal
+* DiastolicBP
+* SystolicBP
+* BMI
+* AlcoholConsumption
+* PhysicalActivity
+* DietQuality
+* SleepQuality
+* Age
+
+Categorical Features:
+
+* Ethnicity
+* EducationLevel
+
+Boolean Features:
+
+* Diagnosis
+* Confusion
+* Disorientation
+* PersonalityChanges
+* DifficultyCompletingTasks
+* Forgetfulness
+* BehavioralProblems
+* MemoryComplaints
+* Hypertension
+* HeadInjury
+* Depression
+* Diabetes
+* CardiovascularDisease
+* FamilyHistoryAlzheimers
+* Smoking
+* Gender
+
+### Normality
+
+```{r}
+num.df <- alz.df %>%
+  select(Age, BMI, AlcoholConsumption, PhysicalActivity,
+         DietQuality, SleepQuality, CholesterolTotal,
+         CholesterolLDL, CholesterolHDL, SystolicBP,
+         CholesterolTriglycerides, ADL, DiastolicBP,
+         MMSE, FunctionalAssessment)
+
+norm.test <- num.df %>%
+  # sapply applys the shapiro test function to every column
+  # take the p-value to check for normality
+  sapply(function(x) shapiro.test(x)$p.value)
+norm.test[norm.test < 0.05]
+```
+
+Binary columns will not have a normal distribution. However, they are indistinguishable from the other continuous variables regardless. According to the Shapiro-Wilks test, none of the continuous variables are normally distributed ($p<0.05$), which is crucial information for determining the normalization technique that should be used when building the model. 
+
+### Correlations
+
+Highly correlated features could effect model performance and may need to be excluded. 
+
+```{r}
+round(cor(num.df, method = "spearman"), 2)
+bin.df <- alz.df %>%
+  select(-c(Age, BMI, AlcoholConsumption, PhysicalActivity,
+         DietQuality, SleepQuality, CholesterolTotal,
+         CholesterolLDL, CholesterolHDL, SystolicBP,
+         CholesterolTriglycerides, ADL, DiastolicBP,
+         MMSE, FunctionalAssessment, DoctorInCharge,
+         PatientID, Diagnosis, EducationLevel, Ethnicity))
+round(cor(bin.df), 2)
+```
+
+It appears there are no highly correlated features that could introduce redundancy.
+
+---
+
+## Data Preparation
+
+### Selection
+
+With a goal of predicting whether an individual has Alzheimers Disease or not, certain features will be excluded due to having no predictive value that satisfies the objective here. The following variables will be excluded from training:
+
+* PatientID - Acts as a unique identifier for a given patient and has no effect on an individual having Alzheimers
+* EducationLevel - Irrelevant to whether an individual has Alzheimers
+* DoctorInCharge - Irrelevant to whether an individual has Alzheimers
+
+Removal of these variables leaves us with 29 reasonable predictive features for Alzheimers Disease.
+
+### Cleaning
+
+```{r}
+# remove unused columns
+alz.clean <- alz.df %>%
+  select(
+    -PatientID,
+    -EducationLevel,
+    -DoctorInCharge,
+    -Ethnicity
+  )
+```
+
+### Encoding
+
+One-hot encoding will be performed on the "Ethnicity" column as its current designation as a factor is not well-suited for acting as a predicting feature for diagnosing Alzheimers. 
+
+```{r}
+alz.clean$Ethnicity_0 <- ifelse(alz.df$Ethnicity == 0, 1, 0)
+alz.clean$Ethnicity_1 <- ifelse(alz.df$Ethnicity == 1, 1, 0)
+alz.clean$Ethnicity_2 <- ifelse(alz.df$Ethnicity == 2, 1, 0)
+alz.clean$Ethnicity_3 <- ifelse(alz.df$Ethnicity == 3, 1, 0)
+```
+
+### Outliers
+
+For the purposes of this model, outliers are defined as values falling greater than 1.5 standard deviations from the mean.
+
+```{r}
+calc.outlier <- function(x) {
+  # quantile computes percentiles
+  q1 <- quantile(x, probs = 0.25)
+  q3 <- quantile(x, probs = 0.75)
+  IQR <- q3 - q1
+  # logical vector distinguishes outliers
+  outlier <- x < q1 - (IQR * 1.5) | x > q3 + (IQR * 1.5)
+  # subset outliers based on logical vector indices
+  result <- (x[outlier])
+  # return whatever values are in result
+  if (length(result) > 0) {
+    return(result)
+  }
+  return("None")
+}
+
+outlier.test <- num.df %>%
+  # sapply across numeric columns
+  sapply(function(x) calc.outlier(x))
+outlier.test
+```
+
+There are no outliers that need to be handled.
+
+### Data Typing
+
+The target variable, diagnosis, will be treated as a factor since the knn model will be trained 
+
+```{r}
+alz.clean$Diagnosis <- factor(alz.clean$Diagnosis, labels = c("No", "Yes"))
+summary(alz.clean$Diagnosis)
+```
+
+---
+
+## Modeling
+
+### Design Training & Testing Subsets
+
+As seen when factoring the target variable, "Diagnosis", there is a slight imbalance between the binary observations denoting a Alzheimers diagnosis or not. Alzheimers diagnosis observations make up `r round(sum(alz.df$Diagnosis == 1 / nrow(alz.df) * 100), 1)`% of the dataset, while no Alzheimers diagnosis observations only make up `r round(sum(alz.df$Diagnosis == 0 / nrow(alz.df) * 100), 1)`% of the dataset. To account for this when splitting the training and testing datasets, createDataPartition() from the caret package will be used to select indices stratified according to "Diagnosis".
+
+The training and testing datasets are created along with the testing labels by appropriately assigning diagnosis.rows.
+
+```{r}
+set.seed(123)
+# used to preserve class distribution
+# list = FALSE ensures a vector is returned 
+diagnosis.rows <- createDataPartition(alz.clean$Diagnosis, p = 0.8, list = FALSE)
+
+# assign 80% of partitioned rows to training set
+train80x <- alz.clean[diagnosis.rows, ]
+# remaining 20% of partitioned rows assigned to testing set
+test20x <- alz.clean[-diagnosis.rows, ]
+# true labels of the test set
+alz.test.labels <- alz.clean[-diagnosis.rows, "Diagnosis"]
+```
+
+### Model Construction & Normalization
+
+An initial model will be trained with the data undergoing standardized z-score normalization in the process as a default to see if the model performs well.
+
+* trainControl() represents the computational nuances, like cross validations, that will be passed to train()
+* train() sets up a grid of tuning parameters for the classification and calculates a resampling-based performance measure by default
+
+```{r}
+param.grids <- list(
+  # hyperparameters
+  'Decision Tree' = expand.grid(cp = seq(0.01, 0.1, length.out = 10)), 
+  'Support Vector Machine' = expand.grid(C = c(0.1, 1, 10), sigma = c(0.1, 1)),
+  'XGBoost' = expand.grid(
+    nrounds = c(50, 100, 200),
+    eta = c(0.01, 0.1, 1),         
+    max_depth = c(3, 5, 7),      
+    gamma = 0,                      
+    colsample_bytree = 1,           
+    min_child_weight = 1,           
+    subsample = 1),
+  'Random Forest' = expand.grid(mtry = c(2, 3)),
+  'K-Nearest Neighbors' = expand.grid(k = c(3, 5, 7))
+)
+
+# control parameters
+ctrl <- trainControl(method = "repeatedcv",
+                     repeats = 3,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary)
+
+models <- list(
+  'Decision Tree' = 'rpart',
+  'Random Forest' = 'rf',
+  'K-Nearest Neighbors' = 'knn',
+  'Support Vector Machine' = 'svmRadial',
+  'XGBoost' = 'xgbTree'
+)
+
+model.results <- list()
+
+# train models
+for (name in names(models)) {
+  # set verbosity only for XGBoost
+  if (name == "XGBoost") {
+    model <- suppressWarnings(train(Diagnosis ~ .,
+                                    data = train80x,
+                                    method = models[[name]], 
+                                    trControl = ctrl, tuneGrid = param.grids[[name]], 
+                                    preProcess = c("center", "scale"),
+                                    metric = "ROC",
+                                    verbosity = 0))
+    } else {
+      model <- suppressWarnings(train(Diagnosis ~ .,
+                                      data = train80x,
+                                      method = models[[name]], 
+                                      trControl = ctrl,
+                                      tuneGrid = param.grids[[name]], 
+                                      preProcess = c("center", "scale"),
+                                      metric = "ROC"))
+      }
+
+  # test predictions
+  y_pred <- predict(model, test20x)
+  
+  # confusion matrix
+  report <- confusionMatrix(y_pred, alz.test.labels)
+  print(paste(name, "Classification Metrics:"))
+  print(report)
+  print(paste("Best Parameters:", model$bestTune))
+  
+  model.results[[name]] <- model$results
+}
+```
+
+Implementation of a decision tree model:
+
+```{r}
+ctrl <- trainControl(method = "repeatedcv",
+                     repeats = 3,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary)
+
+dectree.model <- train(Diagnosis ~ .,
+                       data = train80x,
+                       method = "rpart", 
+                       trControl = ctrl,
+                       tuneGrid = expand.grid(cp = seq(0.01, 0.1, length.out = 10)), 
+                       preProcess = c("center", "scale"),
+                       metric = "ROC")
+```
+
+Make predictions using the test data:
+
+```{r}
+alz.predict <- predict(dectree.model, test20x)
+
+confusionMatrix(alz.predict, alz.test.labels)
+
+conf.table <- table(alz.predict, alz.test.labels)
+
+# true positive
+TP <- conf.table[2, 2]
+# true negative
+TN <- conf.table[1, 1]
+# false positive
+FP <- conf.table[1, 2]
+# false negative
+FN <- conf.table[2, 1]
+
+model.accuracy <- round(((TP + TN) / nrow(test20x)) * 100, 1)
+model.tpr <- round((TP / (TP + FN)) * 100, 1)
+model.tnr <- round((TN / (TN + FP)) * 100, 1)
+```
+
+Various metrics are derived from the matrix, including the model's overall accuracy, which is `r model.accuracy`%. Other components of the confusion matrix include:
+
+* True Positives (TP): The correctly predicted positive observations
+* True Negatives (TN): The correctly predicted negative observations
+* False Positive (FP) and False Negatives (FN) are analogously defined
+
+The decision tree model has a true positive rate of `r model.tpr`% and a true negative rate of `r model.tnr`%.
+
+```{r}
+ggplot(dectree.model$results, aes(x = cp, y = ROC)) +
+  geom_line(color = "cornflowerblue", size = 0.8) +
+  geom_point(color = "darkorange2", size = 2) +
+  labs(
+    title = "Alzheimer's Diagnosis Classifier Performance",
+    y = "ROC (AUC)",
+    caption = "Figure 1: Decision tree ROC (AUC) metric variation with complexity parameter (cp)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 13, margin = ggplot2::margin(t = 10)),
+    axis.title.y = element_text(size = 13, margin = ggplot2::margin(r = 10)),
+    plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm"),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    plot.caption.position = "plot",
+    plot.caption = element_text(face = "italic", size = 10, hjust = 0.5)
+  )
+```
+
+---
+
+## Data Source
+
+Alzheimer's Disease Dataset
+https://www.kaggle.com/dsv/8668279
+10.34740/KAGGLE/DSV/8668279
+Kaggle
+Rabie El Kharoua, 2024
+
